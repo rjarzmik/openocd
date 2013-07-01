@@ -30,6 +30,7 @@ struct ublast_lowlevel {
 		     uint32_t *bytes_written);
 	int (*read)(struct ublast_lowlevel *low, uint8_t *buf, unsigned size,
 		    uint32_t *bytes_read);
+	void (*flush)(struct ublast_lowlevel *low);
 	int (*open)(struct ublast_lowlevel *low);
 	int (*close)(struct ublast_lowlevel *low);
 	int (*speed)(struct ublast_lowlevel *low, int speed);

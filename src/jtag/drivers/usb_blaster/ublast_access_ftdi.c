@@ -57,6 +57,10 @@ static int ublast_ftdi_read(struct ublast_lowlevel *low, uint8_t *buf,
 	return ERROR_OK;
 }
 
+static void ublast_ftdi_flush(struct ublast_lowlevel *low)
+{
+}
+
 static int ublast_ftdi_write(struct ublast_lowlevel *low, uint8_t *buf, int size,
 			     uint32_t *bytes_written)
 {
@@ -127,6 +131,7 @@ static struct ublast_lowlevel low = {
 	.close = ublast_ftdi_quit,
 	.read = ublast_ftdi_read,
 	.write = ublast_ftdi_write,
+	.flush = ublast_ftdi_flush,
 	.priv = &info,
 };
 

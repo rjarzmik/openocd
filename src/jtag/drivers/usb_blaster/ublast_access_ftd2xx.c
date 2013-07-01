@@ -71,6 +71,10 @@ static int ublast_ftd2xx_read(struct ublast_lowlevel *low, uint8_t *buf,
 	return ERROR_OK;
 }
 
+static void ublast_ftd2xx_flush(struct ublast_lowlevel *low)
+{
+}
+
 static int ublast_ftd2xx_init(struct ublast_lowlevel *low)
 {
 	FT_STATUS status;
@@ -169,6 +173,7 @@ static struct ublast_lowlevel low = {
 	.close = ublast_ftd2xx_quit,
 	.read = ublast_ftd2xx_read,
 	.write = ublast_ftd2xx_write,
+	.flush = ublast_ftd2xx_flush,
 	.priv = &info,
 };
 
