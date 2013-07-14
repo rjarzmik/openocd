@@ -71,6 +71,7 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <time.h>
+#include <list.h>
 
 /* Size of USB endpoint max packet size, ie. 64 bytes */
 #define MAX_PACKET_SIZE 64
@@ -81,6 +82,15 @@
  * BUF_LEN must be grater than or equal MAX_PACKET_SIZE.
  */
 #define BUF_LEN 4096
+
+struct ublast_readback_request {
+	int nb_byteshift;
+	int nb_bitbang;
+	unsigned char *tdos;
+	struct list_head list;
+	struct scan_command *scan_cmd;
+};
+LIST_HEAD(readback_reqs);
 
 enum gpio_steer {
 	FIXED_0 = 0,
@@ -137,6 +147,8 @@ static struct drvs_map lowlevel_drivers_map[] = {
 	{ NULL, NULL },
 };
 
+static int ublast_handle_readbacks(void);
+
 /*
  * Access functions to lowlevel driver, agnostic of libftdi/libftdxx
  */
@@ -172,6 +184,7 @@ static void ublast_flush(void)
 {
 	DEBUG_JTAG_IO("underway");
 	info.drv->flush(info.drv);
+	ublast_handle_readbacks();
 }
 
 /*
@@ -216,6 +229,8 @@ static void ublast_flush(void)
 #define READ		(1 << 6)
 #define SHMODE		(1 << 7)
 #define READ_TDO	(1 << 0)
+
+#define MAX_BYTESHIFT_NB	(63)	/* bit7 and bit6 busy, others free*/
 
 /**
  * ublast_queue_byte - queue one 'bitbang mode' byte for USB Blaster
@@ -295,7 +310,6 @@ static void ublast_reset(int trst, int srst)
 	info.srst_asserted = srst;
 	out_value = ublast_build_out(SCAN_OUT);
 	ublast_queue_byte(out_value);
-	ublast_flush();
 }
 
 /**
@@ -323,6 +337,7 @@ static void ublast_clock_tms(int tms)
  */
 static void ublast_idle_clock(void)
 {
+	info.tms = 0;
 	uint8_t out = ublast_build_out(SCAN_OUT);
 
 	DEBUG_JTAG_IO(".");
@@ -465,7 +480,6 @@ static void ublast_path_move(struct pathmove_command *cmd)
 		tap_set_state(cmd->path[i]);
 	}
 	ublast_idle_clock();
-	ublast_flush();
 }
 
 /**
@@ -553,23 +567,28 @@ static int ublast_read_bitbang_tdos(uint8_t *dst, uint8_t *src, int nb_bits)
  * As a side effect, the last TDI bit is sent along a TMS=1, and triggers a JTAG
  * TAP state shift if input bits were non NULL.
  *
- * In order to not saturate the USB Blaster queues, this method reads back TDO
- * if the scan type requests it, and stores them back in bits.
+ * As the write is not actually done but just queued, the readback request queue
+ * should be added an item after calling this function. In order to not saturate
+ * the USB Blaster queues, this method queues the readback data on readback
+ * queue, so that ublast_flush() can rework the tdos into a bitstream
  *
  * As a side note, the state of TCK when entering this function *must* be
  * low. This is because byteshift mode outputs TDI on rising TCK and reads TDO
  * on falling TCK if and only if TCK is low before queuing byteshift mode bytes.
  * If TCK was high, the USB blaster will queue TDI on falling edge, and read TDO
  * on rising edge !!!
+ *
+ * Return the allocated structure controlling the request
  */
-static void ublast_queue_tdi(uint8_t *bits, int nb_bits, enum scan_type scan)
+static struct ublast_readback_request *
+ublast_queue_tdi(uint8_t *bits, int nb_bits, enum scan_type scan)
 {
 	int nb8 = nb_bits / 8;
 	int nb1 = nb_bits % 8;
 	int i, trans = 0, read_tdos;
 	uint32_t retlen;
-	uint8_t *tdos = calloc(1, nb8 + nb1);
 	static uint8_t byte0[BUF_LEN];
+	struct ublast_readback_request *req = NULL;
 
 	/*
 	 * As the last TDI bit should always be output in bitbang mode in order
@@ -586,16 +605,24 @@ static void ublast_queue_tdi(uint8_t *bits, int nb_bits, enum scan_type scan)
 	}
 
 	read_tdos = (scan == SCAN_IN || scan == SCAN_IO);
+	if (read_tdos) {
+		req = calloc(1, sizeof(*req));
+		if (!req)
+			return NULL;
+		req->tdos = calloc(1, nb8 + nb1);
+		if (!req->tdos)
+			return NULL;
+		req->nb_byteshift = nb8;
+		req->nb_bitbang = nb1;
+		ublast_buf_read(req->tdos, nb8 + nb1, &retlen);
+	}
+
 	for (i = 0; i < nb8; i += trans) {
-		/*
-		 * Calculate number of bytes to fill USB packet of size MAX_PACKET_SIZE
-		 */
-		trans = MIN(MAX_PACKET_SIZE - 1, nb8 - i);
+		trans = MIN(MAX_BYTESHIFT_NB, nb8 - i);
 
 		/*
 		 * Queue a byte-shift mode transmission, with as many bytes as
 		 * is possible with regard to :
-		 *  - current filling level of write buffer
 		 *  - remaining bytes to write in byte-shift mode
 		 */
 		if (read_tdos)
@@ -607,8 +634,6 @@ static void ublast_queue_tdi(uint8_t *bits, int nb_bits, enum scan_type scan)
 		else
 			ublast_queue_bytes(byte0, trans);
 	}
-	if (read_tdos)
-		ublast_buf_read(tdos, nb8 + nb1, &retlen);
 
 	/*
 	 * Queue the remaining TDI bits in bitbang mode.
@@ -625,20 +650,35 @@ static void ublast_queue_tdi(uint8_t *bits, int nb_bits, enum scan_type scan)
 	 * Ensure clock is in lower state
 	 */
 	ublast_idle_clock();
-	ublast_flush();
 
-	if (read_tdos) {
-		char *str = hexdump(tdos, (nb_bits + 7) / 8);
-		DEBUG_JTAG_IO("read back on TDO: (size=%d, buf=[%s])",
-			      nb_bits / 8 + 1, str);
+	return req;
+}
+
+static int ublast_handle_readbacks(void)
+{
+	struct ublast_readback_request *req, *tmp;
+	int ret = 0, nb_bytes;
+	char *str;
+
+	list_for_each_entry_safe(req, tmp, &readback_reqs, list) {
+		nb_bytes = req->nb_byteshift + req->nb_bitbang;
+		str = hexdump(req->tdos, nb_bytes);
+		DEBUG_JTAG_IO("read back on TDO: (size=%d(%d+%d), buf=[%s])",
+			      nb_bytes, req->nb_byteshift, req->nb_bitbang, str);
 		free(str);
-		ublast_read_byteshifted_tdos(tdos, tdos, nb8);
-		ublast_read_bitbang_tdos(&tdos[nb8], &tdos[nb8], nb1);
-	}
 
-	if (bits)
-		memcpy(bits, tdos, DIV_ROUND_UP(nb_bits, 8));
-	free(tdos);
+		ublast_read_byteshifted_tdos(req->tdos, req->tdos,
+					     req->nb_byteshift);
+		ublast_read_bitbang_tdos(req->tdos + req->nb_byteshift,
+					 req->tdos + req->nb_byteshift,
+					 req->nb_bitbang);
+
+		ret |= jtag_read_buffer(req->tdos, req->scan_cmd);
+		free(req->tdos);
+		list_del(&req->list);
+		free(req);
+	}
+	return ret;
 }
 
 static void ublast_runtest(int cycles, tap_state_t state)
@@ -672,6 +712,7 @@ static int ublast_scan(struct scan_command *cmd)
 	int ret = ERROR_OK;
 	static const char * const type2str[] = { "", "SCAN_IN", "SCAN_OUT", "SCAN_IO" };
 	char *log_buf = NULL;
+	struct ublast_readback_request *req = NULL;
 
 	type = jtag_scan_type(cmd);
 	scan_bits = jtag_build_buffer(cmd, &buf);
@@ -688,7 +729,11 @@ static int ublast_scan(struct scan_command *cmd)
 		  scan_bits, log_buf, cmd->end_state);
 	free(log_buf);
 
-	ublast_queue_tdi(buf, scan_bits, type);
+	req = ublast_queue_tdi(buf, scan_bits, type);
+	if (req) {
+		req->scan_cmd = cmd;
+		list_add_tail(&req->list, &readback_reqs);
+	}
 
 	/*
 	 * As our JTAG is in an unstable state (IREXIT1 or DREXIT1), move it
@@ -700,9 +745,6 @@ static int ublast_scan(struct scan_command *cmd)
 	else
 		tap_set_state(TAP_DRPAUSE);
 
-	ret = jtag_read_buffer(buf, cmd);
-	if (buf)
-		free(buf);
 	ublast_state_move(cmd->end_state);
 	return ret;
 }
@@ -723,11 +765,14 @@ static int ublast_execute_queue(void)
 	     cmd = cmd->next) {
 		switch (cmd->type) {
 		case JTAG_RESET:
+			ublast_flush();
 			ublast_reset(cmd->cmd.reset->trst, cmd->cmd.reset->srst);
+			ublast_flush();
 			break;
 		case JTAG_RUNTEST:
 			ublast_runtest(cmd->cmd.runtest->num_cycles,
 				       cmd->cmd.runtest->end_state);
+			ublast_flush();
 			break;
 		case JTAG_STABLECLOCKS:
 			ublast_stableclocks(cmd->cmd.stableclocks->num_cycles);
@@ -750,6 +795,7 @@ static int ublast_execute_queue(void)
 			break;
 		}
 	}
+	ublast_flush();
 
 	return ret;
 }
