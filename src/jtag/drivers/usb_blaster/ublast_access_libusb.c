@@ -74,7 +74,7 @@ static void usb_reset(struct usb_ctx *ctx)
 
 	rc = libusb_control_transfer(ctx->dev, FTDI_DEVICE_OUT_REQTYPE,
 				     SIO_RESET_REQUEST, SIO_RESET_SIO,
-				     INTERFACE_A, NULL, 0, ctx->timeout);
+				     INTERFACE_C, NULL, 0, ctx->timeout);
 	if (rc)
 		LOG_INFO("control transfer failed : %d\n", rc);
 }
@@ -391,7 +391,7 @@ static int ublast_libusb_init(struct ublast_lowlevel *low)
 	struct usb_ctx *ctx;
 
 	LOG_INFO("usb blaster interface using libusb");
-	ctx = usb_open(low->ublast_vid, low->ublast_pid, 0, 0x81, 0x02);
+	ctx = usb_open(low->ublast_vid, low->ublast_pid, 1, 0x85, 0x06);
 	if (!ctx)
 		return ERROR_JTAG_INIT_FAILED;
 	low->priv = ctx;
