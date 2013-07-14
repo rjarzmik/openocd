@@ -96,8 +96,6 @@ struct ublast_info {
 	int tdi;
 	bool trst_asserted;
 	bool srst_asserted;
-	uint8_t buf[BUF_LEN];
-	int bufidx;
 
 	char *lowlevel_name;
 	struct ublast_lowlevel *drv;
@@ -167,21 +165,10 @@ static int ublast_buf_write(uint8_t *buf, int size, uint32_t *bytes_written)
 	return ret;
 }
 
-static int nb_buf_remaining(void)
+static void ublast_flush(void)
 {
-	return BUF_LEN - info.bufidx;
-}
-
-static void ublast_flush_buffer(void)
-{
-	unsigned int retlen;
-	int nb = info.bufidx, ret = ERROR_OK;
-
-	while (ret == ERROR_OK && nb > 0) {
-		ret = ublast_buf_write(info.buf, nb, &retlen);
-		nb -= retlen;
-	}
-	info.bufidx = 0;
+	DEBUG_JTAG_IO("underway");
+	info.drv->flush(info.drv);
 }
 
 /*
@@ -237,12 +224,17 @@ static void ublast_flush_buffer(void)
  */
 static void ublast_queue_byte(uint8_t abyte)
 {
-	if (nb_buf_remaining() < 1)
-		ublast_flush_buffer();
-	info.buf[info.bufidx++] = abyte;
-	if (nb_buf_remaining() == 0)
-		ublast_flush_buffer();
-	DEBUG_JTAG_IO("(byte=0x%02x)", abyte);
+	unsigned int retlen;
+
+	if (abyte & SHMODE)
+		DEBUG_JTAG_IO("(byte=0x%02x: shiftmode=%d, readback=%d)",
+			      abyte, !!(abyte & SHMODE), !!(abyte & READ_TDO));
+	else
+		DEBUG_JTAG_IO("(byte=0x%02x: shiftmode=%d, readback=%d, pin6=%d, pin8=%d, tms=%d, tdi=%d, tck=%d)",
+			      abyte, !!(abyte & SHMODE), !!(abyte & READ_TDO),
+			      !!(abyte & NCE), !!(abyte & NCS), !!(abyte & TMS),
+			      !!(abyte & TDI), !!(abyte & TCK));
+	ublast_buf_write(&abyte, 1, &retlen);
 }
 
 /**
@@ -300,7 +292,7 @@ static void ublast_reset(int trst, int srst)
 	info.srst_asserted = srst;
 	out_value = ublast_build_out(SCAN_OUT);
 	ublast_queue_byte(out_value);
-	ublast_flush_buffer();
+	ublast_flush();
 }
 
 /**
@@ -398,23 +390,20 @@ static void ublast_clock_tdi_flip_tms(int tdi, enum scan_type type)
  * Queues bytes to be sent to the USB Blaster. The bytes are not
  * actually sent, but stored in a buffer. The write is performed once
  * the buffer is filled, or if an explicit ublast_flush_buffer() is called.
+ *
+ * Returns the number of bytes actually send to lowlevel driver (ie. a non-zero
+ * value implies that a flush happened).
+ *
  */
-static void ublast_queue_bytes(uint8_t *bytes, int nb_bytes)
+static int ublast_queue_bytes(uint8_t *bytes, int nb_bytes)
 {
-	if (info.bufidx + nb_bytes > BUF_LEN) {
-		LOG_ERROR("buggy code, should never queue more that %d bytes",
-			  info.bufidx + nb_bytes);
-		exit(-1);
-	}
+	int ret = 0;
+	unsigned int bytes_written;
+
 	DEBUG_JTAG_IO("(nb_bytes=%d, bytes=[0x%02x, ...])", nb_bytes,
 		      bytes ? bytes[0] : 0);
-	if (bytes)
-		memcpy(&info.buf[info.bufidx], bytes, nb_bytes);
-	else
-		memset(&info.buf[info.bufidx], 0, nb_bytes);
-	info.bufidx += nb_bytes;
-	if (nb_buf_remaining() == 0)
-		ublast_flush_buffer();
+	ublast_buf_write(bytes, nb_bytes, &bytes_written);
+	return ret;
 }
 
 /**
@@ -446,6 +435,7 @@ static void ublast_tms(struct tms_command *cmd)
 {
 	DEBUG_JTAG_IO("(num_bits=%d)", cmd->num_bits);
 	ublast_tms_seq(cmd->bits, cmd->num_bits);
+	ublast_flush();
 }
 
 /**
@@ -472,6 +462,7 @@ static void ublast_path_move(struct pathmove_command *cmd)
 		tap_set_state(cmd->path[i]);
 	}
 	ublast_idle_clock();
+	ublast_flush();
 }
 
 /**
@@ -498,7 +489,8 @@ static void ublast_state_move(tap_state_t state)
 
 /**
  * ublast_read_byteshifted_tdos - read TDO of byteshift writes
- * @buf: the buffer to store the bits
+ * @dst: the buffer to store the bits
+ * @src: the raw byte stream
  * @nb_bits: the number of bits
  *
  * Reads back from USB Blaster TDO bits, triggered by a 'byteshift write', ie. eight
@@ -506,28 +498,19 @@ static void ublast_state_move(tap_state_t state)
  *
  * As the USB blaster stores the TDO bits in LSB (ie. first bit in (byte0,
  * bit0), second bit in (byte0, bit1), ...), which is what we want to return,
- * simply read bytes from USB interface and store them.
- *
- * Returns ERROR_OK if OK, ERROR_xxx if a read error occured
+ * do nothing ...
  */
-static int ublast_read_byteshifted_tdos(uint8_t *buf, int nb_bytes)
+static void ublast_read_byteshifted_tdos(uint8_t *dst, uint8_t *src, int nb_bytes)
 {
-	unsigned int retlen;
-	int ret = ERROR_OK;
-
-	DEBUG_JTAG_IO("%s(buf=%p, num_bits=%d)", __func__, buf, nb_bytes * 8);
-	ublast_flush_buffer();
-	while (ret == ERROR_OK && nb_bytes > 0) {
-		ret = ublast_buf_read(buf, nb_bytes, &retlen);
-		nb_bytes -= retlen;
-	}
-	return ret;
+	DEBUG_JTAG_IO("buf=%p, num_bits=%d", src, nb_bytes * 8);
+	return;
 }
 
 /**
  * ublast_read_bitbang_tdos - read TDO of bitbang writes
- * @buf: the buffer to store the bits
- * @nb_bits: the number of bits
+ * @dst: the buffer to store the bits
+ * @src: the raw byte stream
+ * @nb_bits: the number of bits (between 1 and 9 included)
  *
  * Reads back from USB Blaster TDO bits, triggered by a 'bitbang write', ie. one
  * bit per received byte from USB interface, and store them in buffer, where :
@@ -540,27 +523,20 @@ static int ublast_read_byteshifted_tdos(uint8_t *buf, int nb_bytes)
  *
  * Returns ERROR_OK if OK, ERROR_xxx if a read error occured
  */
-static int ublast_read_bitbang_tdos(uint8_t *buf, int nb_bits)
+static int ublast_read_bitbang_tdos(uint8_t *dst, uint8_t *src, int nb_bits)
 {
 	int nb1 = nb_bits;
 	int i, ret = ERROR_OK;
-	unsigned int retlen;
-	uint8_t tmp[8];
+	uint8_t tmp[9];
 
-	DEBUG_JTAG_IO("%s(buf=%p, num_bits=%d)", __func__, buf, nb_bits);
+	DEBUG_JTAG_IO("%s(buf=%p, num_bits=%d)", __func__, src, nb_bits);
 
-	/*
-	 * Ensure all previous bitbang writes were issued to the dongle, so that
-	 * it returns back the read values.
-	 */
-	ublast_flush_buffer();
-
-	ret = ublast_buf_read(tmp, nb1, &retlen);
+	memcpy(tmp, src, nb1);
 	for (i = 0; ret == ERROR_OK && i < nb1; i++)
 		if (tmp[i] & READ_TDO)
-			*buf |= (1 << i);
+			dst[i /8] |= (1 << i);
 		else
-			*buf &= ~(1 << i);
+			dst[i / 8] &= ~(1 << i);
 	return ret;
 }
 
@@ -587,8 +563,9 @@ static void ublast_queue_tdi(uint8_t *bits, int nb_bits, enum scan_type scan)
 {
 	int nb8 = nb_bits / 8;
 	int nb1 = nb_bits % 8;
-	int nbfree_in_packet, i, trans = 0, read_tdos;
-	uint8_t *tdos = calloc(1, nb_bits / 8 + 1);
+	int i, trans = 0, read_tdos;
+	uint32_t retlen;
+	uint8_t *tdos = calloc(1, nb8 + nb1);
 	static uint8_t byte0[BUF_LEN];
 
 	/*
@@ -610,8 +587,7 @@ static void ublast_queue_tdi(uint8_t *bits, int nb_bits, enum scan_type scan)
 		/*
 		 * Calculate number of bytes to fill USB packet of size MAX_PACKET_SIZE
 		 */
-		nbfree_in_packet = (MAX_PACKET_SIZE - (info.bufidx%MAX_PACKET_SIZE));
-		trans = MIN(nbfree_in_packet - 1, nb8 - i);
+		trans = MIN(MAX_PACKET_SIZE - 1, nb8 - i);
 
 		/*
 		 * Queue a byte-shift mode transmission, with as many bytes as
@@ -627,9 +603,9 @@ static void ublast_queue_tdi(uint8_t *bits, int nb_bits, enum scan_type scan)
 			ublast_queue_bytes(&bits[i], trans);
 		else
 			ublast_queue_bytes(byte0, trans);
-		if (read_tdos)
-			ublast_read_byteshifted_tdos(&tdos[i], trans);
 	}
+	if (read_tdos)
+		ublast_buf_read(tdos, nb8 + nb1, &retlen);
 
 	/*
 	 * Queue the remaining TDI bits in bitbang mode.
@@ -641,17 +617,25 @@ static void ublast_queue_tdi(uint8_t *bits, int nb_bits, enum scan_type scan)
 		else
 			ublast_clock_tdi(tdi, scan);
 	}
-	if (nb1 && read_tdos)
-		ublast_read_bitbang_tdos(&tdos[nb8], nb1);
-
-	if (bits)
-		memcpy(bits, tdos, DIV_ROUND_UP(nb_bits, 8));
-	free(tdos);
 
 	/*
 	 * Ensure clock is in lower state
 	 */
 	ublast_idle_clock();
+	ublast_flush();
+
+	if (read_tdos) {
+		char *str = hexdump(tdos, (nb_bits + 7) / 8);
+		DEBUG_JTAG_IO("read back on TDO: (size=%d, buf=[%s])",
+			      nb_bits / 8 + 1, str);
+		free(str);
+		ublast_read_byteshifted_tdos(tdos, tdos, nb8);
+		ublast_read_bitbang_tdos(&tdos[nb8], &tdos[nb8], nb1);
+	}
+
+	if (bits)
+		memcpy(bits, tdos, DIV_ROUND_UP(nb_bits, 8));
+	free(tdos);
 }
 
 static void ublast_runtest(int cycles, tap_state_t state)
@@ -724,6 +708,7 @@ static void ublast_usleep(int us)
 {
 	DEBUG_JTAG_IO("%s(us=%d)",  __func__, us);
 	jtag_sleep(us);
+	ublast_flush();
 }
 
 static int ublast_execute_queue(void)
@@ -746,6 +731,7 @@ static int ublast_execute_queue(void)
 			break;
 		case JTAG_TLR_RESET:
 			ublast_state_move(cmd->cmd.statemove->end_state);
+			ublast_flush();
 			break;
 		case JTAG_PATHMOVE:
 			ublast_path_move(cmd->cmd.pathmove);
@@ -762,7 +748,6 @@ static int ublast_execute_queue(void)
 		}
 	}
 
-	ublast_flush_buffer();
 	return ret;
 }
 
@@ -779,6 +764,7 @@ static int ublast_execute_queue(void)
 static int ublast_init(void)
 {
 	static uint8_t tms_reset = 0xff;
+	static unsigned char buf0[BUF_LEN];
 	int ret, i;
 
 	if (info.lowlevel_name) {
@@ -815,11 +801,16 @@ static int ublast_init(void)
 		 * Flush USB-Blaster queue fifos
 		 */
 		uint32_t retlen;
-		ublast_buf_write(info.buf, BUF_LEN, &retlen);
+		buf0[0] = ublast_build_out(SCAN_OUT);
+		memset(buf0, buf0[0], sizeof(buf0));
+		ublast_buf_write(buf0, BUF_LEN, &retlen);
+		ublast_flush();
+
 		/*
 		 * Put JTAG in RESET state (five 1 on TMS)
 		 */
 		ublast_tms_seq(&tms_reset, 5);
+		ublast_flush();
 		tap_set_state(TAP_RESET);
 	}
 	return ret;
@@ -931,7 +922,7 @@ COMMAND_HANDLER(ublast_handle_pin_command)
 		if (info.drv) {
 			out_value = ublast_build_out(SCAN_OUT);
 			ublast_queue_byte(out_value);
-			ublast_flush_buffer();
+			ublast_flush();
 		}
 	}
 	return ERROR_OK;
