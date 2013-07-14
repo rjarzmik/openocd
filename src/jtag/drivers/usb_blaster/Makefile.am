@@ -13,6 +13,10 @@ if USB_BLASTER_FTD2XX
 USB_BLASTER_SRC += ublast_access_ftd2xx.c
 endif
 
+if USB_BLASTER_LIBUSB
+USB_BLASTER_SRC += ublast_access_libusb.c
+endif
+
 noinst_HEADERS = ublast_access.h
 
 MAINTAINERCLEANFILES = $(srcdir)/Makefile.in

@@ -131,6 +131,9 @@ static struct drvs_map lowlevel_drivers_map[] = {
 #if BUILD_USB_BLASTER_FTD2XX
 	{ .name = "ftd2xx", .drv_register = ublast_register_ftd2xx },
 #endif
+#if BUILD_USB_BLASTER_LIBUSB
+	{ .name = "libusb", .drv_register = ublast_register_libusb },
+#endif
 	{ NULL, NULL },
 };
 
