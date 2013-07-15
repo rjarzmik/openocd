@@ -26,10 +26,10 @@ struct ublast_lowlevel {
 	uint16_t ublast_pid;
 	char *ublast_device_desc;
 
-	int (*write)(struct ublast_lowlevel *low, uint8_t *buf, int size,
-		     uint32_t *bytes_written);
-	int (*read)(struct ublast_lowlevel *low, uint8_t *buf, unsigned size,
-		    uint32_t *bytes_read);
+	int (*queue_write)(struct ublast_lowlevel *low, uint8_t *buf,
+			   int size, uint32_t *bytes_written);
+	int (*queue_read)(struct ublast_lowlevel *low, uint8_t *buf,
+			  unsigned size, uint32_t *bytes_read);
 	void (*flush)(struct ublast_lowlevel *low);
 	int (*open)(struct ublast_lowlevel *low);
 	int (*close)(struct ublast_lowlevel *low);

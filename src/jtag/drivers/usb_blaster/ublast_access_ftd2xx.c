@@ -28,17 +28,34 @@
 #include <jtag/commands.h>
 
 #include "ublast_access.h"
+#include "ublast_access_common.h"
 
 #include <ftd2xx.h>
 #include "jtag/drivers/ftd2xx_common.h"
+
+static LIST_HEAD(read_reqs);
+static LIST_HEAD(write_reqs);
 
 static FT_HANDLE *ublast_getftdih(struct ublast_lowlevel *low)
 {
 	return low->priv;
 }
 
-static int ublast_ftd2xx_write(struct ublast_lowlevel *low, uint8_t *buf, int size,
-			      uint32_t *bytes_written)
+static int ublast_ftd2xx_queue_read(struct ublast_lowlevel *low, uint8_t *buf,
+				    unsigned size, uint32_t *bytes_read)
+{
+	*bytes_read = size;
+	return ublast_common_queue_read(&read_reqs, buf, size);
+}
+
+static int ublast_ftd2xx_queue_write(struct ublast_lowlevel *low, uint8_t *buf,
+				     int size, uint32_t *bytes_written)
+{
+	*bytes_written = size;
+	return ublast_common_queue_write(&write_reqs, buf, (unsigned int)size);
+}
+
+static int ublast_ftd2xx_do_write(struct ublast_lowlevel *low, uint8_t *buf, int size)
 {
 	FT_STATUS status;
 	DWORD dw_bytes_written;
@@ -46,16 +63,14 @@ static int ublast_ftd2xx_write(struct ublast_lowlevel *low, uint8_t *buf, int si
 
 	status = FT_Write(*ftdih, buf, size, &dw_bytes_written);
 	if (status != FT_OK) {
-		*bytes_written = dw_bytes_written;
 		LOG_ERROR("FT_Write returned: %s", ftd2xx_status_string(status));
 		return ERROR_JTAG_DEVICE_ERROR;
 	}
-	*bytes_written = dw_bytes_written;
-	return ERROR_OK;
+	return dw_bytes_written;
 }
 
-static int ublast_ftd2xx_read(struct ublast_lowlevel *low, uint8_t *buf,
-			     unsigned size, uint32_t *bytes_read)
+static int ublast_ftd2xx_do_read(struct ublast_lowlevel *low, uint8_t *buf,
+				 unsigned size)
 {
 	DWORD dw_bytes_read;
 	FT_STATUS status;
@@ -63,16 +78,21 @@ static int ublast_ftd2xx_read(struct ublast_lowlevel *low, uint8_t *buf,
 
 	status = FT_Read(*ftdih, buf, size, &dw_bytes_read);
 	if (status != FT_OK) {
-		*bytes_read = dw_bytes_read;
 		LOG_ERROR("FT_Read returned: %s", ftd2xx_status_string(status));
 		return ERROR_JTAG_DEVICE_ERROR;
 	}
-	*bytes_read = dw_bytes_read;
-	return ERROR_OK;
+	return dw_bytes_read;
 }
 
 static void ublast_ftd2xx_flush(struct ublast_lowlevel *low)
 {
+	int retval;
+
+	retval = ublast_common_flush(low, &read_reqs, &write_reqs,
+				     ublast_ftd2xx_do_read,
+				     ublast_ftd2xx_do_write);
+	if (retval < 0)
+		LOG_ERROR("FT  returned: %s", ftd2xx_status_string(retval));
 }
 
 static int ublast_ftd2xx_init(struct ublast_lowlevel *low)
@@ -171,8 +191,8 @@ static struct ublast_lowlevel_priv {
 static struct ublast_lowlevel low = {
 	.open = ublast_ftd2xx_init,
 	.close = ublast_ftd2xx_quit,
-	.read = ublast_ftd2xx_read,
-	.write = ublast_ftd2xx_write,
+	.queue_read = ublast_ftd2xx_queue_read,
+	.queue_write = ublast_ftd2xx_queue_write,
 	.flush = ublast_ftd2xx_flush,
 	.priv = &info,
 };

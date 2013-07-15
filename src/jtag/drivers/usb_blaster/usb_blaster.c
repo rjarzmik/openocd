@@ -151,18 +151,14 @@ static char *hexdump(uint8_t *buf, unsigned int size)
 
 static int ublast_buf_read(uint8_t *buf, unsigned size, uint32_t *bytes_read)
 {
-	int ret = info.drv->read(info.drv, buf, size, bytes_read);
-	char *str = hexdump(buf, *bytes_read);
+	int ret = info.drv->queue_read(info.drv, buf, size, bytes_read);
 
-	DEBUG_JTAG_IO("(size=%d, buf=[%s]) -> %u", size, str,
-		      *bytes_read);
-	free(str);
 	return ret;
 }
 
 static int ublast_buf_write(uint8_t *buf, int size, uint32_t *bytes_written)
 {
-	int ret = info.drv->write(info.drv, buf, size, bytes_written);
+	int ret = info.drv->queue_write(info.drv, buf, size, bytes_written);
 	char *str = hexdump(buf, *bytes_written);
 
 	DEBUG_JTAG_IO("(size=%d, buf=[%s]) -> %u", size, str,
