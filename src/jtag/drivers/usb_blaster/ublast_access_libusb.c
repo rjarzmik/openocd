@@ -29,6 +29,9 @@
 #include "helper/log.h"
 #include <libusb-1.0/libusb.h>
 
+#define NB_READ_REQS 5
+#define NB_WRITE_REQS 5
+
 #define FTDI_DEVICE_OUT_REQTYPE (LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE)
 #define FTDI_DEVICE_IN_REQTYPE (0x80 | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE
 #define SIO_RESET_REQUEST             0x00
@@ -36,26 +39,46 @@
 #define SIO_RESET_PURGE_RX 1
 #define SIO_RESET_PURGE_TX 2
 
+struct fifo_req {
+	struct list_head list;
+	unsigned char *buf;
+	int bufsize;
+	struct libusb_transfer *xfer;
+	struct reqs_progress *progress;
+};
+
+struct ep_fifo {
+	struct list_head free;
+	struct list_head queued;
+};
+
+struct reqs_progress {
+	struct list_head queued;
+	struct list_head done;
+
+	struct ep_fifo fifo;
+	int overflowed;
+};
+
 struct usb_ctx {
 	libusb_context *usb_ctx;
 	libusb_device_handle *dev;
 	int interface;
 	uint8_t ep_in;
 	uint8_t ep_out;
+	uint16_t ep_in_maxpkt_size;
+	uint16_t ep_out_maxpkt_size;
 	int timeout;
-	struct list_head read_reqs;
-	struct list_head write_reqs;
+
+	struct reqs_progress read_progress;
+	struct reqs_progress write_progress;
 };
 
 struct rw_req {
 	void *buf;
 	int nb;
+	int nb_filled;
 	struct list_head list;
-};
-
-struct transfer_result {
-	int nb_sumitted;
-	int nb_finished;
 };
 
 /** Port interface for chips with multiple interfaces */
@@ -68,17 +91,159 @@ enum ftdi_interface
     INTERFACE_D   = 4
 };
 
+static void read_cb(struct libusb_transfer *transfer);
+static void write_cb(struct libusb_transfer *transfer);
+
+static char *hexdump(uint8_t *buf, unsigned int size)
+{
+	unsigned int i;
+	char *str = calloc(size * 2 + 1, 1);
+
+	for (i = 0; i < size; i++)
+		sprintf(str + 2*i, "%02x", buf[i]);
+	return str;
+}
+
 static void usb_reset(struct usb_ctx *ctx)
 {
 	int rc;
 
 	rc = libusb_control_transfer(ctx->dev, FTDI_DEVICE_OUT_REQTYPE,
 				     SIO_RESET_REQUEST, SIO_RESET_SIO,
-				     INTERFACE_C, NULL, 0, ctx->timeout);
+				     INTERFACE_A, NULL, 0, ctx->timeout);
 	if (rc)
 		LOG_INFO("control transfer failed : %d\n", rc);
 }
 
+static int alloc_free_reqs(struct usb_ctx *ctx, int nb_req, struct ep_fifo *fifo,
+			   struct reqs_progress *progress,
+			   int maxpkt_size)
+{
+	int i;
+	struct fifo_req *req;
+
+	for (i = 0; i < NB_READ_REQS; i++) {
+		req = malloc(sizeof(struct fifo_req));
+		if (!req)
+			return -ENOMEM;
+		req->buf = malloc(maxpkt_size);
+		if (!req->buf)
+			return -ENOMEM;
+		req->progress = progress;
+		req->bufsize = maxpkt_size;
+		list_add(&req->list, &fifo->free);
+		req->xfer = libusb_alloc_transfer(0);
+	}
+	return 0;
+}
+
+static void fill_free_reqs(struct usb_ctx *ctx, struct ep_fifo *fifo,
+			   uint8_t ep,
+			   void (*cb)(struct libusb_transfer *transfer))
+{
+	struct fifo_req *req;
+
+	list_for_each_entry(req, &fifo->free, list) {
+		libusb_fill_bulk_transfer(req->xfer, ctx->dev, ep,
+					  req->buf, req->bufsize,
+					  cb, req, ctx->timeout);
+	}
+}
+
+static void release_free_reqs(struct ep_fifo *fifo)
+{
+	struct rw_req *req, *tmp;
+
+	list_for_each_entry_safe(req, tmp, &fifo->free, list) {
+		free(req->buf);
+		list_del(&req->list);
+		free(req);
+	}
+}
+
+static int feed_read_fifo(struct fifo_req *req, struct ep_fifo *fifo)
+{
+	int rc = 0;
+
+	rc = libusb_submit_transfer(req->xfer);
+	if (!rc)
+		list_move_tail(&req->list, &fifo->queued);
+	else
+		LOG_ERROR("queue_free_reqs() submit urb error : %d", rc);
+	return rc;
+}
+
+static int feed_write_fifo(struct fifo_req *dst_req, struct ep_fifo *fifo,
+			   struct reqs_progress *progress)
+{
+	int nb, remain;
+	unsigned char *dst = dst_req->buf;
+	struct rw_req *src_req;
+
+	if (list_empty(&progress->queued))
+		return 0;
+
+	remain = dst_req->bufsize;
+	while (remain > 0 && !list_empty(&progress->queued)) {
+		src_req = list_first_entry(&progress->queued, struct rw_req,
+					   list);
+		nb = MIN(remain, src_req->nb - src_req->nb_filled);
+		if (nb) {
+			memcpy(dst, src_req->buf + src_req->nb_filled, nb);
+			src_req->nb_filled += nb;
+			remain -= nb;
+			dst += nb;
+		} else {
+			list_move_tail(&src_req->list, &progress->done);
+		}
+	}
+	list_move_tail(&dst_req->list, &fifo->queued);
+	dst_req->xfer->length = dst_req->bufsize - remain;
+	return libusb_submit_transfer(dst_req->xfer);
+}
+
+static int queue_read_free_reqs(struct usb_ctx *ctx)
+{
+	struct reqs_progress *progress = &ctx->read_progress;
+	struct ep_fifo *fifo = &progress->fifo;
+	struct fifo_req *req, *tmp;
+	int rc = 0;
+
+	list_for_each_entry_safe(req, tmp, &fifo->free, list) {
+		rc = feed_read_fifo(req, fifo);
+		if (rc)
+			break;
+	}
+	return rc;
+}
+
+static int queue_write_free_reqs(struct usb_ctx *ctx)
+{
+	struct reqs_progress *progress = &ctx->write_progress;
+	struct ep_fifo *fifo = &progress->fifo;
+	struct fifo_req *req, *tmp;
+	int rc = 0;
+
+	list_for_each_entry_safe(req, tmp, &fifo->free, list) {
+		rc = feed_write_fifo(req, fifo, progress);
+		if (rc)
+			break;
+	}
+	return 0;
+}
+
+static int cancel_all_fifo(struct usb_ctx *ctx, struct ep_fifo *fifo)
+{
+	struct fifo_req *req, *tmp;
+	int rc = 0;
+
+	DEBUG_JTAG_IO("cancel and unqueue request");
+	list_for_each_entry_safe(req, tmp, &fifo->queued, list)
+		libusb_cancel_transfer(req->xfer);
+	while (!list_empty(&fifo->queued))
+		rc = libusb_handle_events(ctx->usb_ctx);
+	return rc;
+}
 
 static struct usb_ctx* usb_open(const uint16_t vid, const uint16_t pid,
 				 const int usb_interface, const uint8_t ep_in,
@@ -86,16 +251,33 @@ static struct usb_ctx* usb_open(const uint16_t vid, const uint16_t pid,
 {
 	int rc;
 	struct usb_ctx *ctx;
+	uint16_t maxpkt_in = 64, maxpkt_out = 64;
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx)
 		goto err_mem;
+	ctx->ep_in = ep_in;
+	ctx->ep_out = ep_out;
+	INIT_LIST_HEAD(&ctx->read_progress.queued);
+	INIT_LIST_HEAD(&ctx->read_progress.done);
+	INIT_LIST_HEAD(&ctx->read_progress.fifo.free);
+	INIT_LIST_HEAD(&ctx->read_progress.fifo.queued);
+
+	INIT_LIST_HEAD(&ctx->write_progress.queued);
+	INIT_LIST_HEAD(&ctx->write_progress.done);
+	INIT_LIST_HEAD(&ctx->write_progress.fifo.free);
+	INIT_LIST_HEAD(&ctx->write_progress.fifo.queued);
+
 	rc = libusb_init(&ctx->usb_ctx);
-	if (rc < 0)
+	if (rc < 0) {
+		LOG_ERROR("libusb_init failed with %d", rc);
 		goto err_init;
+	}
 	ctx->dev = libusb_open_device_with_vid_pid(ctx->usb_ctx, vid, pid);
-	if (!ctx->dev)
+	if (!ctx->dev) {
+		LOG_ERROR("libusb_open_device_with_vid_pid failed");
 		goto err_open;
+	}
 	ctx->interface = usb_interface;
 	rc = libusb_claim_interface(ctx->dev, ctx->interface);
 	if (rc != LIBUSB_SUCCESS) {
@@ -103,14 +285,27 @@ static struct usb_ctx* usb_open(const uint16_t vid, const uint16_t pid,
 		goto err_interface;
 	}
 	usb_reset(ctx);
-	ctx->ep_in = ep_in;
-	ctx->ep_out = ep_out;
-	INIT_LIST_HEAD(&ctx->read_reqs);
-	INIT_LIST_HEAD(&ctx->write_reqs);
 
 	ctx->timeout = 0;
+	rc = alloc_free_reqs(ctx, NB_READ_REQS, &ctx->read_progress.fifo,
+			     &ctx->read_progress, maxpkt_in);
+	if (rc) {
+		LOG_ERROR("alloc_free_reqs() failed with %d", rc);
+		goto err_interface;
+	}
+	rc = alloc_free_reqs(ctx, NB_WRITE_REQS, &ctx->write_progress.fifo,
+			     &ctx->write_progress, maxpkt_out);
+	if (rc) {
+		LOG_ERROR("alloc_free_reqs() failed with %d", rc);
+		goto err_alloc_write_reqs;
+	}
+	fill_free_reqs(ctx, &ctx->read_progress.fifo, ctx->ep_in, read_cb);
+	fill_free_reqs(ctx, &ctx->write_progress.fifo, ctx->ep_out, write_cb);
+
 	return ctx;
 
+err_alloc_write_reqs:
+	release_free_reqs(&ctx->read_progress.fifo);
 err_interface:
 	libusb_close(ctx->dev);
 err_open:
@@ -125,6 +320,8 @@ static void usb_close(struct usb_ctx *ctx)
 {
 	libusb_close(ctx->dev);
 	libusb_exit(ctx->usb_ctx);
+	release_free_reqs(&ctx->read_progress.fifo);
+	release_free_reqs(&ctx->write_progress.fifo);
 	free(ctx);
 }
 
@@ -136,7 +333,8 @@ static int usb_queue_read(struct usb_ctx *ctx, void *buf, int nb)
 		return -ENOMEM;
 	req->buf = buf;
 	req->nb = nb;
-	list_add_tail(&req->list, &ctx->read_reqs);
+	req->nb_filled = 0;
+	list_add_tail(&req->list, &ctx->read_progress.queued);
 	return nb;
 }
 
@@ -154,52 +352,95 @@ static int usb_queue_write(struct usb_ctx *ctx, void *buf, int nb, bool copy)
 		free(req);
 		return -ENOMEM;
 	}
+	INIT_LIST_HEAD(&req->list);
 	req->nb = nb;
+	req->nb_filled = 0;
 	memcpy(req->buf, buf, nb);
-	list_add_tail(&req->list, &ctx->write_reqs);
+	list_add_tail(&req->list, &ctx->write_progress.queued);
 	return nb;
 }
 
 static void read_cb(struct libusb_transfer *transfer)
 {
-	struct transfer_result *result = transfer->user_data;
+	struct fifo_req *src_req = transfer->user_data;
+	struct rw_req *dst_req;
+	unsigned char *src = src_req->buf;
+	int nb, rc = 0, remain = transfer->actual_length;
+	struct reqs_progress *progress = src_req->progress;
+	char *str;
 
-	DEBUG_JTAG_IO("status=%d, transferred %d+%d=%d",
-		      transfer->status,
-		      result->nb_finished,
-		      transfer->actual_length,
-		      result->nb_finished + transfer->actual_length);
-	if (transfer->actual_length >= 2) {
-		memmove(transfer->buffer, transfer->buffer + 2,
-			transfer->actual_length - 2);
-		result->nb_finished += transfer->actual_length - 2;
+	str = hexdump(src, remain);
+	DEBUG_JTAG_IO("status=%d progress=%d transferred %d [%s]",
+		      transfer->status, progress->overflowed,
+		      remain, str);
+	free(str);
 
-		if (result->nb_finished < result->nb_sumitted) {
-			transfer->length -= (transfer->actual_length - 2);
-			transfer->buffer += (transfer->actual_length - 2);
-			if (libusb_submit_transfer(transfer))
-				result->nb_finished = result->nb_sumitted;
-		}
+	list_move_tail(&src_req->list, &progress->fifo.free);
+	if (transfer->status) {
+		progress->overflowed = transfer->status;
+		return;
 	}
+
+	remain -= 2;
+	src += 2;
+	while (!progress->overflowed && remain > 0 && !rc) {
+		if (list_empty(&progress->queued)) {
+			progress->overflowed = 1;
+			break;
+		}
+		dst_req = list_first_entry(&progress->queued, struct rw_req,
+					   list);
+		nb = MIN(remain, dst_req->nb - dst_req->nb_filled);
+		if (nb) {
+			memcpy(dst_req->buf + dst_req->nb_filled, src, nb);
+			dst_req->nb_filled += nb;
+			remain -= nb;
+			src += nb;
+		}
+		if (dst_req->nb_filled >= dst_req->nb) {
+			list_move_tail(&dst_req->list, &progress->done);
+			str = hexdump(dst_req->buf, dst_req->nb);
+			DEBUG_JTAG_IO("filled submited read %d : [%s]",
+				      dst_req->nb, str);
+			free(str);
+		}
+		DEBUG_JTAG_IO("dst_req: buf=%p, nb_filled=%d, nb=%d : copied %d bytes",
+			      dst_req->buf, dst_req->nb_filled, dst_req->nb, nb);
+	}
+	rc = feed_read_fifo(src_req, &progress->fifo);
+	if (rc)
+		progress->overflowed = rc;
 }
 
 static void write_cb(struct libusb_transfer *transfer)
 {
-	struct transfer_result *result = transfer->user_data;
+	struct fifo_req *dst_req = transfer->user_data;
+	struct reqs_progress *progress = dst_req->progress;
+	int rc;
 
-	DEBUG_JTAG_IO("status=%d, transferred %d+%d=%d",
+	char *str = hexdump(dst_req->buf, transfer->actual_length);
+	DEBUG_JTAG_IO("status=%d, transferred %d [%s]",
 		      transfer->status,
-		      result->nb_finished,
-		      transfer->actual_length,
-		      result->nb_finished + transfer->actual_length);
-	result->nb_finished += transfer->actual_length;
+		      transfer->actual_length, str);
+	free(str);
 
-	if (result->nb_finished < result->nb_sumitted) {
-		transfer->length -= transfer->actual_length;
-		transfer->buffer += transfer->actual_length;
-		if (libusb_submit_transfer(transfer))
-			result->nb_finished = result->nb_sumitted;
+	list_move_tail(&dst_req->list, &progress->fifo.free);
+
+	if (transfer->status) {
+		progress->overflowed = transfer->status;
+		return;
 	}
+
+	if (transfer->actual_length < transfer->length) {
+		transfer->buffer += transfer->actual_length;
+		transfer->length -= transfer->actual_length;
+		rc = libusb_submit_transfer(dst_req->xfer);
+		return;
+	}
+
+	rc = feed_write_fifo(dst_req, &progress->fifo, progress);
+	if (rc)
+		progress->overflowed = rc;
 }
 
 static int get_bytes_of_reqs(struct list_head *reqs)
@@ -212,140 +453,53 @@ static int get_bytes_of_reqs(struct list_head *reqs)
 	return nb;
 }
 
-static void xfer_reqs_to_buf(unsigned char *buf, struct list_head *reqs)
-{
-	struct rw_req *req;
-
-	list_for_each_entry(req, reqs, list) {
-		memmove(buf, req->buf, req->nb);
-		buf += req->nb;
-	}
-}
-
-static char *hexdump(uint8_t *buf, unsigned int size)
-{
-	unsigned int i;
-	char *str = calloc(size * 2 + 1, 1);
-
-	for (i = 0; i < size; i++)
-		sprintf(str + 2*i, "%02x", buf[i]);
-	return str;
-}
-
-static void xfer_buf_to_reqs(unsigned char *buf, struct list_head *reqs)
-{
-	struct rw_req *req;
-	char *str;
-
-	list_for_each_entry(req, reqs, list) {
-		str = hexdump(buf, req->nb);
-		free(str);
-
-		memmove(req->buf, buf, req->nb);
-		buf += req->nb;
-	}
-}
-
 static int usb_flush(struct usb_ctx *ctx)
 {
-	int nb_read, nb_read_align, nb_write, rc = 0;
-	unsigned char *buf_read = NULL, *buf_write = NULL;
-	struct libusb_transfer *read_transfer, *write_transfer;
-	struct transfer_result read_result = { .nb_finished = 0 };
-	struct transfer_result write_result = { .nb_finished = 0 };
+	int nb_read, nb_write, rc = 0;
+	struct reqs_progress *rprog, *wprog;
 
-	nb_read = get_bytes_of_reqs(&ctx->read_reqs);
-	nb_read_align = (((nb_read + 2)/ 64) + 1) * 64;
-	nb_write = get_bytes_of_reqs(&ctx->write_reqs);
+	rprog = &ctx->read_progress;
+	wprog = &ctx->write_progress;
+	nb_read = get_bytes_of_reqs(&rprog->queued);
+	nb_write = get_bytes_of_reqs(&wprog->queued);
 	DEBUG_JTAG_IO("write %d, read %d", nb_write, nb_read);
 
 	if (nb_read == 0 && nb_write == 0)
 		return 0;
-	read_result.nb_sumitted = nb_read;
-	write_result.nb_sumitted = nb_write;
+	/*
+	 * Initialize progresses
+	 */
+	rprog->overflowed = 0;
+	wprog->overflowed = 0;
 
-	buf_read = malloc(nb_read_align);
-	buf_write = malloc(nb_write);
-	if (!buf_read || !buf_write) {
-		rc = -ENOMEM;
-		goto out;
-	}
-
-	xfer_reqs_to_buf(buf_read, &ctx->read_reqs);
-	xfer_reqs_to_buf(buf_write, &ctx->write_reqs);
-
-	char *str = hexdump(buf_write, nb_write);
-	DEBUG_JTAG_IO("actual write %d bytes [%s]", nb_write, str);
-	free(str);
-
-	read_transfer = libusb_alloc_transfer(0);
-	write_transfer = libusb_alloc_transfer(0);
-	libusb_fill_bulk_transfer(read_transfer, ctx->dev, ctx->ep_in,
-				  buf_read, nb_read_align,
-				  read_cb, &read_result, ctx->timeout);
-	libusb_fill_bulk_transfer(write_transfer, ctx->dev, ctx->ep_out,
-				  buf_write, nb_write,
-				  write_cb, &write_result, ctx->timeout);
-	if (nb_write)
-		rc = libusb_submit_transfer(write_transfer);
-	if (!rc && nb_read)
-		rc = libusb_submit_transfer(read_transfer);
+	if (nb_read)
+		rc = queue_read_free_reqs(ctx);
+	if (!rc && nb_write)
+		rc = queue_write_free_reqs(ctx);
 
 	/* Polling loop, more or less taken from libftdi */
-	while ((read_result.nb_finished < nb_read ||
-		write_result.nb_finished < nb_write) && !rc) {
+	while (!rc &&
+	       (!list_empty(&rprog->queued) || !list_empty(&wprog->fifo.queued))) {
 		rc = libusb_handle_events(ctx->usb_ctx);
-
 		keep_alive();
-		if (!rc)
-			continue;
-		if (nb_write)
-			libusb_cancel_transfer(write_transfer);
-		if (nb_read)
-			libusb_cancel_transfer(read_transfer);
-		rc = 0;
-		while (!rc && nb_write &&
-		       write_transfer->status != LIBUSB_TRANSFER_CANCELLED)
-			rc = libusb_handle_events(ctx->usb_ctx);
-		while (!rc && nb_read &&
-		       read_transfer->status != LIBUSB_TRANSFER_CANCELLED)
-			rc = libusb_handle_events(ctx->usb_ctx);
 	}
-
 	if (rc) {
 		LOG_ERROR("libusb_handle_events() failed with %d", rc);
 		rc = -EIO;
-	} else if (nb_write && write_result.nb_finished < nb_write) {
-		LOG_ERROR("usb device did not accept all data: %d, tried %d",
-			  write_result.nb_finished, nb_write);
+	} else if (rprog->overflowed) {
+		LOG_ERROR("usb device did not send all data: rc = %d",
+			  rprog->overflowed);
 		rc = -EIO;
-	} else if (nb_read && read_result.nb_finished < nb_read) {
-		LOG_ERROR("usb device did not return all data: %d, expected %d",
-			  read_result.nb_finished, nb_read);
-		rc = -EIO;;
+	} else if (wprog->overflowed) {
+		LOG_ERROR("usb device did not accept all data: rc = %d",
+			  wprog->overflowed);
+		rc = -EIO;
 	} else {
 		rc = 0;
-		xfer_buf_to_reqs(buf_read, &ctx->read_reqs);
-		xfer_buf_to_reqs(buf_write, &ctx->write_reqs);
-		str = hexdump(buf_read, nb_read);
-		DEBUG_JTAG_IO("actual read %d bytes [%s]", nb_read, str);
-		free(str);
 	}
-	INIT_LIST_HEAD(&ctx->read_reqs);
-	INIT_LIST_HEAD(&ctx->write_reqs);
 
-	if (nb_write)
-		libusb_free_transfer(write_transfer);
-	if (nb_read)
-		libusb_free_transfer(read_transfer);
-	/* if (rc) */
-	/* 	usb_purge(ctx); */
-
-out:
-	if (buf_read)
-		free(buf_read);
-	if (buf_write)
-		free(buf_write);
+	cancel_all_fifo(ctx, &rprog->fifo);
+	cancel_all_fifo(ctx, &wprog->fifo);
 	return rc;
 }
 
@@ -391,9 +545,12 @@ static int ublast_libusb_init(struct ublast_lowlevel *low)
 	struct usb_ctx *ctx;
 
 	LOG_INFO("usb blaster interface using libusb");
-	ctx = usb_open(low->ublast_vid, low->ublast_pid, 1, 0x85, 0x06);
-	if (!ctx)
+	/* ctx = usb_open(low->ublast_vid, low->ublast_pid, 1, 0x85, 0x06); */
+	ctx = usb_open(low->ublast_vid, low->ublast_pid, 1, 0x81, 0x02);
+	if (!ctx) {
+		LOG_ERROR("usb_open error");
 		return ERROR_JTAG_INIT_FAILED;
+	}
 	low->priv = ctx;
 
 	return ERROR_OK;
